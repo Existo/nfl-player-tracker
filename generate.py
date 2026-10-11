@@ -154,21 +154,45 @@ def build(season,stats,rosters,injuries,teamstats=None,strict=True):
  roster_week=max(fint(r.get('week')) for r in rosters)
  injury_week=max((fint(r.get('week')) for r in injuries),default=0)
  if not injury_week:warnings.append('No current injury-report week found. No player is assumed healthy.')
- # A player may be omitted from a roster provider and still have official stats in the season.
+ # Weekly roster feeds may have the next week's rosters for just a subset of teams
+ # (e.g. the teams on bye). Use the latest available weekly snapshot PER TEAM.
+ # Never silently treat a week-old roster as a same-week official report.
+ team_roster_week={}
+ for r in rosters:
+  tm=team(r.get('team'))
+  if tm in TEAMS:
+   team_roster_week[tm]=max(team_roster_week.get(tm,0),fint(r.get('week')))
+ stale={tm:wk for tm,wk in team_roster_week.items() if wk < roster_week}
+ if stale:
+  warnings.append('Team rosters from earlier weekly snapshots (not verified for the latest week): '+
+                  ', '.join(f'{tm} W{wk}' for tm,wk in sorted(stale.items())))
+ unavailable=sorted(TEAMS-set(team_roster_week))
+ if unavailable:
+  warnings.append('No weekly roster snapshot for teams: '+', '.join(unavailable))
+ if strict and (unavailable or any(wk < roster_week-2 for wk in team_roster_week.values())):
+  raise ValueError('One or more team roster snapshots are missing or more than 2 weeks old; no publish.')
+ # A player may be omitted from the current roster source and still have season stats.
  released_codes={'CUT','UFA','NWT','RFA','TRC','TRD','TRT','RSR','RET'}
- current_rows=[r for r in rosters if fint(r.get('week'))==roster_week and team(r.get('team')) in TEAMS and clean(r.get('status')).upper() not in released_codes]
+ current_rows=[r for r in rosters if team(r.get('team')) in TEAMS
+               and fint(r.get('week'))==team_roster_week[team(r.get('team'))]
+               and clean(r.get('status')).upper() not in released_codes]
  current={}
  for r in current_rows:
   pid=clean(r.get('gsis_id'))
   if not pid:continue
-  if pid in current and team(r.get('team'))!=team(current[pid].get('team')):
-   warnings.append(f'Multiple teams on latest-week roster for player ID {pid}; manual check necessary.')
-  if pid not in current or roster_code(current[pid]) and not roster_code(r):current[pid]=r
+  prev=current.get(pid)
+  if prev and team(r.get('team'))!=team(prev.get('team')):
+   warnings.append(f'Conflicting latest team snapshots for player {pid}: '+
+                   f'{team(prev.get("team"))} W{prev.get("week")} vs {team(r.get("team"))} W{r.get("week")}. '+
+                   'Review the team assignment.')
+  if (prev is None or fint(r.get('week'))>fint(prev.get('week')) or
+      (fint(r.get('week'))==fint(prev.get('week')) and roster_code(prev) and not roster_code(r))):
+   current[pid]=r
  roster_teams={team(r.get('team')) for r in current.values()}
  if strict and (len(roster_teams)!=32 or len(current)<1200):
-  raise ValueError(f'Roster coverage below threshold: {len(roster_teams)} teams, {len(current)} players. No publish.')
- if len(roster_teams)!=32:warnings.append(f'Only {len(roster_teams)} teams present in latest roster week; expected 32.')
- if len(current)<1200:warnings.append('Latest-week roster contains fewer than 1,200 unique players.')
+  raise ValueError(f'Roster coverage below threshold after per-team fallback: {len(roster_teams)} teams, {len(current)} players. No publish.')
+ if len(roster_teams)!=32:warnings.append(f'Only {len(roster_teams)} teams represented after per-team fallback; expected 32.')
+ if len(current)<1200:warnings.append('Latest available team rosters contain fewer than 1,200 unique players.')
  # Include every stat-documented season participant, even if traded/released.
  agg=defaultdict(lambda:{'metrics':defaultdict(float),'fields':set(),'weeks':set(),'teams':set(),'weekly':defaultdict(lambda:defaultdict(float)),'weekly_fields':defaultdict(set)})
  # Audit player/team-week aggregate totals against separately released team box scores.
@@ -263,6 +287,7 @@ def build(season,stats,rosters,injuries,teamstats=None,strict=True):
   note=[]
   if not r:note.append('Not on latest weekly roster; sourced from '+('statistical participation' if a else 'injury report'))
   if not a:note.append('No statistical row; does not prove no game participation')
+  if r and fint(r.get('week'))<roster_week:note.append(f'Team roster snapshot is week {r.get("week")}, not league latest week {roster_week}; verify changes')
   if injury_week and injury_week < roster_week:note.append('Injury data is older than roster data')
   if tm=='—':note.append('Unresolved NFL team')
   row={'id':pid,'name':name,'team':tm,'pos':pos,'jersey':clean(r.get('jersey_number')),
@@ -270,7 +295,7 @@ def build(season,stats,rosters,injuries,teamstats=None,strict=True):
        'injury_reason':reason,'practice_status':clean((injury or {}).get('practice_status')),
        'game_status_text':clean((injury or {}).get('report_status')),
        'stats_weeks':sorted(a['weeks']) if a else [],'stats_teams':sorted(a['teams']) if a else [],
-       'stats_week':stat_week,'roster_week':roster_week,'injury_week':injury_week if injury else None,
+       'stats_week':stat_week,'roster_week':fint(r.get('week')) if r else None,'injury_week':injury_week if injury else None,
        'has_stats':bool(a),'stat_fields':sorted(available),'metrics':{k:nval(v) for k,v in metrics.items()},
        'notes':'; '.join(note),'weekly':weekly}
   outputs.append(row)
@@ -280,9 +305,9 @@ def build(season,stats,rosters,injuries,teamstats=None,strict=True):
  if injury_week and injury_week < stat_week:warnings.append('Injury report week precedes most recent stats week; designations may be outdated.')
  data={'season':season,'retrieved_utc':datetime.now(timezone.utc).isoformat(timespec='seconds'),
        'stats_week':stat_week,'roster_week':roster_week,'injury_week':injury_week,
-       'team_count':len(roster_teams),'players':len(outputs),'positions':sorted(positions),
+       'team_count':len(roster_teams),'roster_team_weeks':dict(sorted(team_roster_week.items())),'players':len(outputs),'positions':sorted(positions),
        'counts':dict(coverage),'warnings':warnings,'sources':SOURCES(season),'rows':outputs,'team_checks':team_checks,'team_comparisons':tested,
-       'method':'Player ID / GSIS join; most recent weekly rosters + all current-season participants; REG stats only; additive metrics aggregated. ' +
+       'method':'Player ID / GSIS join; latest available snapshot per team, with snapshot week disclosed; all season participants; REG stats only; additive metrics aggregated. ' +
        'GP counts recorded statistical weeks, not official games played. Injury codes reflect only newest available report week. Absent stats are null.'}
  return data
 
