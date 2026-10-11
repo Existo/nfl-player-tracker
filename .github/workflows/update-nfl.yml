@@ -1,0 +1,57 @@
+
+name: Daily NFL Player Stats
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '15 13 * * *'
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: nfl-pages
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify processing logic
+        run: python -m unittest discover -s . -p 'test_*.py' -v
+      - name: Build verified NFL stats
+        run: |
+          python - <<'PY'
+          import generate as g
+          src = g.SOURCES(2026)
+          feeds = {k: g.read_http_csv(src[k]) for k in ('stats', 'rosters', 'teamstats')}
+          # The nflverse injury report feed stopped after the 2024 season.
+          # Supply the required empty schema; do not invent player injury status.
+          blank = [{'gsis_id':'', 'week':'0', 'report_status':'', 'practice_primary_injury':''}]
+          data = g.build(2026, feeds['stats'], feeds['rosters'], blank, feeds['teamstats'], strict=True)
+          data['warnings'].append('2026 official injury reports are not connected. Game injury designations are unverified.')
+          data['sources']['injuries'] = 'Unavailable from nflverse for 2026'
+          g.output_files(data, 'site')
+          print('Player records:', data['players'], 'Through stats week:', data['stats_week'])
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nfl-2026-csv-data
+          path: site/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site/
+      - id: publish
+        uses: actions/deploy-pages@v4
